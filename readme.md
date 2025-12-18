@@ -34,7 +34,7 @@ cargo install bootimage
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/your-username/valhalla_os
+git clone https://github.com/adityachauhan0/valhalla_os
 cd valhalla_os
 
 ```
