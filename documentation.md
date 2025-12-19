@@ -1,120 +1,128 @@
-# Valhalla OS Documentation
+# Valhalla OS Technical Documentation
 
-This document provides a detailed technical overview of Valhalla OS, a 64-bit micro-kernel written in Rust for the x86_64 architecture. It serves as a reference for understanding the core operating system concepts regarding how they are implemented in this codebase.
+This document provides a comprehensive deep-dive into the design, architecture, and implementation details of Valhalla OS. It describes the system from the bootloader up to the user shell, explaining the design choices and technical hurdles overcome during development.
 
-## 1. Core Architecture
+## 1. System Architecture Overview
 
-The OS follows a monolithic kernel design where major services (memory management, interrupt handling, drivers) run in kernel space. It uses the `bootloader` crate to boot into long mode (64-bit) and maps the kernel to the higher half of memory.
+Valhalla OS is a 64-bit micro-kernel written in Rust. It runs on the x86_64 architecture and leverages specific hardware features like the Global Descriptor Table (GDT), Interrupt Descriptor Table (IDT), and Paging.
 
-### Entry Point (`src/main.rs`)
+*   **Language**: Rust (Nightly, `no_std`)
+*   **Bootloader**: `bootloader` crate (v0.9.x spec)
+*   **Architecture**: Monolithic Kernel design (currently), aiming for micro-kernel characteristics.
+*   **Build System**: Cargo with `bootimage` for disk creation.
 
-The entry point is defined using the `entry_point!` macro from the `bootloader` crate.
-- **Function**: `kernel_main(boot_info: &'static BootInfo) -> !`
-- **Role**: Initializes the kernel, sets up memory, and starts the main loop.
-- **Loop**: The kernel enters an infinite loop, executing `x86_64::instructions::hlt()` to halt the CPU until the next interrupt, saving power.
+---
 
-## 2. VGA Text Mode (`src/vga_buffer.rs`)
+## 2. Level 0: The Foundation
 
-The VGA text buffer is the primary output mechanism, mapping characters to the screen via Memory-Mapped I/O at address `0xb8000`.
+This layer handles the most basic interactions with the hardware, allowing the kernel to output information and survive basic crashes.
 
-### Implementation
-- **Volatile Wrappers**: The `volatile` crate is used to wrap memory writes (`Volatile<ScreenChar>`) to prevent the Rust compiler from optimizing away writes to the VGA buffer.
-- **Global Writer**: A global `WRITER` instance is protected by a `Spinlock` (via `spin::Mutex`) and initialized strictly once using `lazy_static!`.
-- **Macros**: Custom `print!` and `println!` macros are exported to provide a standard output interface similar to Rust's std library.
+### 2.1 VGA Text Buffer Driver (`src/vga_buffer.rs`)
 
-```rust
-// Key structures
-struct ScreenChar {
-    ascii_character: u8,
-    color_code: ColorCode,
-}
+The kernel communicates with the user primarily through the VGA text buffer, a memory-mapped I/O region located at physical address `0xb8000`.
 
-// 0xb8000 is the standard VGA text buffer address
-const VGA_BUFFER_ADDR: usize = 0xb8000;
-```
+*   **Memory-Mapped I/O**: The buffer consists of 25 rows and 80 columns. Each screen character takes up 2 bytes: one for the ASCII character and one for the color attribute (foreground/background).
+*   **Volatile Access**: To prevent the Rust compiler from optimizing away memory writes (since it doesn't know about side effects on hardware), the `volatile` crate is used to wrap the buffer.
+*   **Concurrency**: A global static `WRITER` is protected by a `spin::Mutex`. Since the OS cannot use standard OS threads or mutexes yet, a spinlock is used to ensure that only one core (or interrupt handler) writes to the screen at a time.
+*   **Macros**: `print!` and `println!` are implemented by hooking into the global writer, providing a seamless high-level interface.
 
-## 3. Global Descriptor Table (GDT) & Stack Protection (`src/gdt.rs`)
+### 2.2 Global Descriptor Table (GDT) & Stack Protection (`src/gdt.rs`)
 
-The GDT is used primarily for switching between kernel/user space and, critically in this OS, for **Stack Overflow Protection**.
+While the GDT is required for 64-bit mode, Valhalla OS utilizes it specifically for **Stack Overflow Protection**.
 
-### Implementation
-- **TSS (Task State Segment)**: A TSS is defined to hold the **Interrupt Stack Table (IST)**.
-- **Double Fault Handler**: A specific stack is allocated for double faults. The index of this stack (`DOUBLE_FAULT_IST_INDEX`) is registered in the IDT. If a stack overflow occurs (causing a double fault), the CPU switches to this known good stack, allowing the kernel to catch the panic instead of causing a triple fault (reboot).
+*   **The Double Fault Problem**: If the kernel overflows the stack, it triggers a page fault. If the CPU cannot push the page fault frame onto the full stack, it triggers a Double Fault. If the Double Fault handler cannot run (because the stack is still full), the CPU Triple Faults and reboots.
+*   **The Solution (IST)**: We set up an **Interrupt Stack Table (IST)** in the Task State Segment (TSS).
+*   **Implementation**:
+    1.  A dedicated stack is allocated in `gdt.rs`.
+    2.  This stack is registered in the IST at index `DOUBLE_FAULT_IST_INDEX`.
+    3.  The IDT entry for Double Faults is configured to physically switch the CPU to this fresh stack when the exception occurs, allowing the kernel to catch the panic gracefully.
 
-```rust
-// The Double Fault stack is part of the implementation for robustness
-pub const DOUBLE_FAULT_IST_INDEX: u16 = 0;
-```
+---
 
-## 4. Interrupt Handling (`src/interrupts.rs`)
+## 3. Level 1: Interrupts & Input
 
-The OS handles both hardware interrupts and CPU exceptions using an **Interrupt Descriptor Table (IDT)**.
+This layer allows the OS to respond to asynchronous hardware events and CPU exceptions.
 
-### Implementation
-- **IDT**: Statically defined using `lazy_static`.
-- **Exceptions Handled**:
-    - `Breakpoint`: For debugging.
-    - `Page Fault`: Prints the accessed address (`CR2` register) and error code.
-    - `Double Fault`: Diverts to the dedicated stack defined in the GDT.
-- **Hardware Interrupts**:
-    - **PIC (8259)**: Two chained PICs are used to map hardware interrupts to CPU interrupt vectors starting at offset 32 (to avoid conflicts with CPU exceptions 0-31).
-    - **Timer**: Fires periodically; handler notifies the PIC `notify_end_of_interrupt`.
-    - **Keyboard**: Reads scancodes from port `0x60`, decodes them using `pc-keyboard`, and pushes valid characters to a global `COMMAND_BUFFER`.
+### 3.1 Interrupt Descriptor Table (IDT) (`src/interrupts.rs`)
 
-## 5. Memory Management (`src/memory.rs`)
+The IDT maps exception vectors to function handlers.
 
-Memory management handles the translation between virtual and physical memory (Paging) and provides a frame allocator.
+*   **Exceptions**:
+    *   **Breakpoint**: Used for unit testing (pauses execution).
+    *   **Page Fault**: Critical for debugging memory issues. accessible via `CR2` register.
+    *   **Double Fault**: As described above, handled on a separate stack.
+*   **Calling Convention**: Handlers use the `x86-interrupt` calling convention, which saves all registers (not just caller-saved ones) to prevent corrupting the state of the interrupted process.
 
-### Implementation
-- **Paging**: The OS uses an `OffsetPageTable`. This technique maps the entire physical memory to a specific range in virtual memory (provided by the bootloader), allowing the kernel to access any physical address by adding an offset.
-- **Frame Allocator** (`BootInfoFrameAllocator`):
-    - Parses the memory map provided by the BIOS/UEFI.
-    - Returns physical execution frames (`PhysFrame`) for memory allocation.
-    - **Algorithm**: A simple linear iterator that returns the next available 'Usable' 4KiB frame.
+### 3.2 Hardware Interrupts & PIC
 
-```rust
-// Initialization of the page table
-pub unsafe fn init(physical_memory_offset: VirtAddr) -> OffsetPageTable<'static> { ... }
-```
+To handle external devices like the Timer and Keyboard, we us the 8259 Programmable Interrupt Controller (PIC).
 
-## 6. Heap Allocation (`src/allocator.rs`)
+*   **Remapping**: By default, the PIC maps interrupts to ranges 0-15, contradicting CPU exceptions. We remap the generic interrupts to offsets **32-47**.
+    *   `PIC_1_OFFSET`: 32
+*   **Timer**: defaults to ~18.2Hz (or configured otherwise). The handler sends an "End of Interrupt" (EOI) signal to the PIC to confirm processing.
 
-To support dynamic types like `Box`, `Vec`, and `String`, a heap allocator is implemented.
+### 3.3 PS/2 Keyboard Driver
 
-### Implementation
-- **Allocator**: Uses `linked_list_allocator::LockedHeap`.
-- **Heap Region**:
-    - **Start Address**: `0x_4444_4444_0000`
-    - **Size**: 100 KiB
-- **Mapping**: The `init_heap` function maps the virtual pages of the heap region to physical frames allocated by the frame allocator and initializes the `LockedHeap`.
+Keyboard input is processed via Port I/O `0x60`.
 
-```rust
-#[global_allocator]
-static ALLOCATOR: LockedHeap = LockedHeap::empty();
-```
+*   **Scancodes**: The keyboard sends raw bytes (scancodes). We use `pc-keyboard` to decode Scancode Set 1.
+*   **Processing**:
+    1.  Interrupt fires -> `keyboard_interrupt_handler` reads byte.
+    2.  `layouts::Us104Key` maps scancode to Char.
+    3.  Character is pushed to `COMMAND_BUFFER`.
+    4.  If `\n` (Enter) is pressed, `COMMAND_READY` flag is set to notify the shell.
 
-## 7. Shell & User Input (`src/shell.rs`)
+---
 
-A basic command-line interface allows interaction with the running kernel.
+## 4. Level 2: Memory Management
 
-### Implementation
-- **Command Loop**: In `main.rs`, the kernel checks `interrupts::COMMAND_READY`.
-- **Input Handling**: The keyboard interrupt handler populates `COMMAND_BUFFER`. When 'Enter' is pressed, it sets the ready flag.
-- **Command Processor**: `shell::interpret` parses the string and executes:
-    - `help`: Lists commands.
-    - `ping`: Responds with "Pong!".
-    - `clear`: Scrolls the screen (prints newlines).
-    - `heap_test`: Allocates a `Box` to verify heap functionality.
+This is the most complex part of the kernel ("The Crown Jewel"), transforming raw physical RAM into a safe, dynamic environment.
 
-## Summary of Control Flow
+### 4.1 Paging (`src/memory.rs`)
 
-1. **Boot**: `_start` -> `kernel_main`.
-2. **Init**:
-   - `gdt::init()` sets up stack switching.
-   - `interrupts::init_idt()` prepares exception handling.
-   - `PICS` initialized for hardware interrupts.
-   - Memory Paging & Frame Allocator initialized.
-   - Heap mapped and active.
-3. **Run**:
-   - Splash screen prints.
-   - `loop`: Checks for user input -> Executes Shell command -> `hlt()` (Sleep).
+*   **4-Level Paging**: The OS uses the standard x86_64 4-level page table structure.
+*   **Offset Page Table**: The bootloader maps the *entire* physical memory to a virtual address range.
+    *   If physical memory is at `0x0`, and offset is `0xFFFF_8000_0000_0000`, the kernel can access physical `0x1000` at virtual `0xFFFF_8000_0000_1000`.
+    *   This allows the kernel to easily edit page tables since it can "reach" the physical frames from virtual space.
+
+### 4.2 Frame Allocator
+
+To create new page tables or map new memory, we need physical frames (4KiB chunks).
+*   **Strategy**: `BootInfoFrameAllocator` reads the memory map passed by the BIOS/UEFI.
+*   **Logic**: It iterates through regions marked `Usable`. It returns the address of the next available frame and increments a counter. This is a linear allocator; it does not yet support freeing frames (leaks memory if pages are unmapped).
+
+### 4.3 Dynamic Heap (`src/allocator.rs`)
+
+To support standard Rust types like `Vec`, `Box`, and `String`, we implement a heap.
+
+*   **Heap Address**: Fixed at specific virtual address `0x_4444_4444_0000`.
+*   **Heap Size**: 100 KiB.
+*   **Allocator**: We use the `linked_list_allocator` crate.
+    *   The `init_heap` function manually maps the 100 KiB virtual range to new physical frames allocated by our Frame Allocator.
+    *   It then initializes the `LockedHeap` global allocator, allowing safe `no_std` dynamic memory usage.
+
+---
+
+## 5. Development Log: Challenges & Solutions
+
+Developing a bare-metal OS involves resolving unique errors that don't exist in standard software development.
+
+| Issue | Technical Root Cause | Solution Implemented |
+| :--- | :--- | :--- |
+| **Compiler Error: E0423** | `ScancodeSet1` is a Unit Struct (zero-sized type) in the `pc-keyboard` crate, but text was treating it like a value. | Explicitly instantiated it: `ScancodeSet1::new()` or `ScancodeSet1 {}`. |
+| **Bootloader Field Missing** | The `bootloader` crate v0.10+ dramatically changed the `BootInfo` struct, removing `physical_memory_offset`. | We pinned dependency to **`0.9.23`** and enabled the `map_physical_memory` feature in `Cargo.toml`. |
+| **Linker Error: Alloc** | The `alloc` crate is part of the standard library but not linked by default in `no_std`. | Added `alloc` to the `build-std` array in `.cargo/config.toml` to recompile it for our custom target. |
+| **Pointer Casting Panic** | The heap initializer expects a raw pointer `*mut u8` but we had a `usize` address. | Performed an explicit cast `HEAP_START as *mut u8`. |
+| **Triple Fault Loops** | Occurred early on when IDT entries were malformed or the Stack Overflow handler failed. | Defining a robust **Double Fault Handler** with a dedicated IST stack prevented the CPU from resetting, allowing us to see the panic message. |
+
+---
+
+## 6. The Shell
+
+The user interface (`src/shell.rs`) is a simple loop running in `main.rs`.
+
+*   **Architecture**: Event-driven. The main loop sleeps (`hlt`) until an interrupt (Keyboard) wakes it.
+*   **Commands**:
+    *   `ping`: Trivial test of responsiveness.
+    *   `heap_test`: Critical test. It allocates a `Box<i32>` and prints the pointer. If memory management failed, this would crash the kernel.
+    *   `clear`: Simulates a screen clear by printing newlines.
