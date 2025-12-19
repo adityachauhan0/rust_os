@@ -6,6 +6,8 @@ A 64-bit micro-kernel written in **Rust** for the x86_64 architecture.
 Valhalla OS demonstrates the core principles of operating system design, including hardware abstraction, interrupt handling, and complex memory management through a 4-level paging system and a dynamic heap allocator.
 <img width="763" height="573" alt="Screenshot 2025-12-18 162447" src="https://github.com/user-attachments/assets/c0445b7c-6db6-4d76-bdeb-89505e57d564" />
 
+📖 **[Read the Documentation](documentation.md)** for a detailed technical breakdown.
+
 ## 🚀 How to Run
 
 ### Prerequisites
